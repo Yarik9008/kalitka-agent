@@ -413,7 +413,11 @@ WantedBy=$( [[ $SCOPE == system ]] && echo multi-user.target || echo default.tar
 	if [[ $SCOPE == system ]]; then
 		printf '%s' "$UNIT_BODY" >/etc/systemd/system/kalitka-agent.service
 		systemctl daemon-reload
-		systemctl enable --now kalitka-agent.service
+		systemctl enable kalitka-agent.service
+		# Именно restart, а не `enable --now`: при повторной установке сервис уже
+		# запущен, `--now` его не трогает, и агент продолжает работать со старой
+		# конфигурацией. Заодно снимается вторая копия, если она осталась.
+		systemctl restart kalitka-agent.service
 		sleep 2
 		systemctl --no-pager --lines=10 status kalitka-agent.service || true
 		k_say "сервис: systemctl status kalitka-agent"
@@ -421,7 +425,8 @@ WantedBy=$( [[ $SCOPE == system ]] && echo multi-user.target || echo default.tar
 		mkdir -p "$HOME/.config/systemd/user"
 		printf '%s' "$UNIT_BODY" >"$HOME/.config/systemd/user/kalitka-agent.service"
 		systemctl --user daemon-reload
-		systemctl --user enable --now kalitka-agent.service
+		systemctl --user enable kalitka-agent.service
+		systemctl --user restart kalitka-agent.service
 		loginctl enable-linger "$USER" >/dev/null 2>&1 || \
 			k_warn "не удалось включить linger — агент остановится при выходе из сессии"
 		sleep 2
