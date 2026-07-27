@@ -228,6 +228,9 @@ kalitka: установка агента на компьютер, к котор�
     --mode РЕЖИМ       auto (по умолчанию) | vpn | direct
     --direct           то же, что --mode direct
     --ssh-port PORT    какой локальный порт публиковать как SSH (0 — не публиковать)
+    --public-ssh [П]   публичный адрес для SSH, как у ngrok: подключаться можно
+                       обычным ssh без клиентской части. Без аргумента порт
+                       выдаёт сервер, с аргументом — фиксированный
     --vnc-port PORT    добавить приватный туннель к VNC (например 5900)
     --http PORT        опубликовать локальный веб-сервис на https://ID.<домен>
     --socks HOST:PORT  адрес SOCKS вашего VPN-клиента, если не определился сам
@@ -238,6 +241,7 @@ USAGE
 ENROLL=""
 NAME=""
 SSH_PORT=22
+PUBLIC_SSH=""
 VNC_PORT=""
 HTTP_PORT=""
 SOCKS_OVERRIDE=""
@@ -250,6 +254,10 @@ while [[ $# -gt 0 ]]; do
 		--mode)       MODE="$2"; shift 2 ;;
 		--direct)     MODE=direct; shift ;;
 		--ssh-port)   SSH_PORT="$2"; shift 2 ;;
+		--public-ssh)
+			# Аргумент необязателен: без него порт выберет сервер (remotePort = 0).
+			if [[ "${2:-}" =~ ^[0-9]+$ ]]; then PUBLIC_SSH="$2"; shift 2
+			else PUBLIC_SSH=0; shift; fi ;;
 		--vnc-port)   VNC_PORT="$2"; shift 2 ;;
 		--http)       HTTP_PORT="$2"; shift 2 ;;
 		--socks)      SOCKS_OVERRIDE="$2"; shift 2 ;;
@@ -323,6 +331,22 @@ type = "stcp"
 secretKey = "$K_SECRET"
 localIP = "127.0.0.1"
 localPort = $SSH_PORT
+EOF
+	fi
+
+	if [[ -n "$PUBLIC_SSH" ]]; then
+		cat <<EOF
+
+# Публичный SSH — модель ngrok: сервер открывает порт в интернет, и
+# подключиться можно обычным ssh, без клиентской части. Обратная сторона —
+# ваш sshd становится виден снаружи, так что вход по паролю лучше отключить.
+# remotePort = 0 означает «пусть порт выберет сервер».
+[[proxies]]
+name = "$NAME-pubssh"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = $SSH_PORT
+remotePort = $PUBLIC_SSH
 EOF
 	fi
 
@@ -436,6 +460,8 @@ cat <<EOF
  Агент установлен. Что теперь доступно:
 
    SSH:   на машине-клиенте  ./client/kalitka.sh ssh $NAME
+$( [[ -n "$PUBLIC_SSH" ]] && echo "   SSH (публичный): адрес и порт покажет веб-панель — подключаться
+          обычным ssh, клиентская часть не нужна" )
 $( [[ -n "$VNC_PORT" ]] && echo "   VNC:   ./client/kalitka.sh open $NAME-vnc 5900" )
 $( [[ -n "$HTTP_PORT" ]] && echo "   Веб:   https://$NAME.$K_SUB" )
 
