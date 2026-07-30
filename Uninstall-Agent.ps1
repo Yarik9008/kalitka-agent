@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    kalitka: полное удаление агента с этого компьютера (Windows).
+    gatelink: полное удаление агента с этого компьютера (Windows).
 
 .DESCRIPTION
     Снимает задачу планировщика, останавливает процесс и стирает всё, что
@@ -15,8 +15,8 @@ param([switch]$DryRun)
 
 $ErrorActionPreference = 'Continue'
 
-function Say  { param($m) Write-Host "[kalitka] $m" -ForegroundColor Cyan }
-function Warn { param($m) Write-Host "[kalitka] $m" -ForegroundColor Yellow }
+function Say  { param($m) Write-Host "[gatelink] $m" -ForegroundColor Cyan }
+function Warn { param($m) Write-Host "[gatelink] $m" -ForegroundColor Yellow }
 
 if ($DryRun) { Say "пробный запуск, ничего не удаляю" }
 
@@ -32,11 +32,11 @@ function Drop {
 }
 
 # ── задача планировщика ─────────────────────────────────────────────────
-if (Get-ScheduledTask -TaskName 'kalitka-agent' -ErrorAction SilentlyContinue) {
-    Say "снимаю задачу планировщика kalitka-agent"
+if (Get-ScheduledTask -TaskName 'gatelink-agent' -ErrorAction SilentlyContinue) {
+    Say "снимаю задачу планировщика gatelink-agent"
     if (-not $DryRun) {
-        Stop-ScheduledTask -TaskName 'kalitka-agent' -ErrorAction SilentlyContinue
-        Unregister-ScheduledTask -TaskName 'kalitka-agent' -Confirm:$false -ErrorAction SilentlyContinue
+        Stop-ScheduledTask -TaskName 'gatelink-agent' -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskName 'gatelink-agent' -Confirm:$false -ErrorAction SilentlyContinue
     }
 }
 
@@ -48,8 +48,8 @@ if ($procs) {
 }
 
 # ── файлы ───────────────────────────────────────────────────────────────
-Drop (Join-Path $env:ProgramData 'kalitka')
-Drop (Join-Path $env:LOCALAPPDATA 'kalitka')
+Drop (Join-Path $env:ProgramData 'gatelink')
+Drop (Join-Path $env:LOCALAPPDATA 'gatelink')
 
 if (-not $DryRun) {
     Say "агент удалён полностью"

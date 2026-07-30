@@ -1,17 +1,18 @@
 <#
 .SYNOPSIS
-    kalitka: установка агента на Windows-компьютер, к которому нужно подключаться.
+    gatelink: установка агента на Windows-компьютер, к которому нужно подключаться.
 
 .DESCRIPTION
     Агент (frpc) держит одно исходящее соединение до сервера — через SOCKS
     вашего VPN-клиента. Портов на этой машине наружу не открывается, проброс
     на роутере не нужен.
 
-    По умолчанию публикуется RDP (3389). SSH — только если в системе включён
-    OpenSSH Server.
+    Ничего не публикуется само: какие локальные порты станут доступны, задаётся
+    параметрами. Это осознанно — раньше RDP публиковался по умолчанию, и
+    установка агента молча открывала к нему доступ.
 
 .EXAMPLE
-    .\Install-Agent.ps1 -Enroll 'eyJzZXJ2...' -Name home-pc
+    .\Install-Agent.ps1 -Enroll 'eyJzZXJ2...' -RdpPort 3389
 
 .EXAMPLE
     .\Install-Agent.ps1 -Enroll '...' -HttpPort 3000 -SshPort 22
@@ -20,7 +21,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$Enroll,
     [string]$Name,
-    [int]$RdpPort = 3389,
+    [int]$RdpPort = 0,
     [int]$SshPort = 0,
     [int]$VncPort = 0,
     [int]$HttpPort = 0,
@@ -34,9 +35,9 @@ if ($Direct) { $Mode = 'direct' }
 
 $ErrorActionPreference = 'Stop'
 
-function Say  { param($m) Write-Host "[kalitka] $m" -ForegroundColor Cyan }
-function Warn { param($m) Write-Host "[kalitka] $m" -ForegroundColor Yellow }
-function Die  { param($m) Write-Host "[kalitka] ОШИБКА: $m" -ForegroundColor Red; exit 1 }
+function Say  { param($m) Write-Host "[gatelink] $m" -ForegroundColor Cyan }
+function Warn { param($m) Write-Host "[gatelink] $m" -ForegroundColor Yellow }
+function Die  { param($m) Write-Host "[gatelink] ОШИБКА: $m" -ForegroundColor Red; exit 1 }
 
 $IsAdmin = ([Security.Principal.WindowsPrincipal] `
     [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -49,12 +50,30 @@ try {
 } catch {
     Die "строка подключения не разбирается — скопирована не целиком?"
 }
-if (-not $cfg.server -or -not $cfg.token) { Die "в строке подключения нет server/token" }
+if (-not $cfg.token) { Die "в строке подключения нет token" }
+if (-not $cfg.server -and -not $cfg.gate) { Die "в строке подключения нет ни server, ни gate" }
+if (-not $cfg.secret) { Die "в строке подключения нет секрета приватных туннелей" }
 
 # ── имя машины ──────────────────────────────────────────────────────────
-if (-not $Name) { $Name = $env:COMPUTERNAME }
+# Имя приходит в строке подключения: секрет этой машины выведен именно из него
+# (HMAC от имени), поэтому переименовать машину здесь нельзя — секрет перестанет
+# совпадать с тем, что посчитает визитор. Нужно другое имя — новая строка:
+# server/enroll.py agent --name ДРУГОЕ-ИМЯ
+if ($cfg.name) {
+    if ($Name -and $Name -ne $cfg.name) {
+        Die "строка подключения выдана на имя «$($cfg.name)», а -Name задаёт «$Name».
+Секрет этой машины выведен из имени, поэтому имя менять здесь нельзя.
+Возьмите строку для нужного имени: server/enroll.py agent --name $Name"
+    }
+    $Name = $cfg.name
+} else {
+    if (-not $Name) { $Name = $env:COMPUTERNAME }
+    Warn "строка подключения старого формата — секрет общий для всех машин."
+    Warn "Перевыпустите её на сервере: server/enroll.py agent --name ИМЯ"
+}
 $Name = ($Name.ToLower() -replace '[^a-z0-9-]', '-').Trim('-')
 if (-not $Name) { Die "не удалось определить имя машины, задайте -Name" }
+if ($Name.Length -gt 31) { Die "имя длиннее 31 символа: $Name" }
 Say "имя этой машины в туннелях: $Name"
 
 # ── SOCKS VPN-клиента ───────────────────────────────────────────────────
@@ -93,8 +112,8 @@ if ($Mode -eq 'vpn') { Say "режим: через VPN (SOCKS $Socks)" }
 else { Say "режим: прямой — websocket по HTTPS на $($cfg.gate):$($cfg.gatePort), VPN не нужен" }
 
 # ── куда ставить ────────────────────────────────────────────────────────
-$Root = if ($IsAdmin) { Join-Path $env:ProgramData 'kalitka' }
-        else { Join-Path $env:LOCALAPPDATA 'kalitka' }
+$Root = if ($IsAdmin) { Join-Path $env:ProgramData 'gatelink' }
+        else { Join-Path $env:LOCALAPPDATA 'gatelink' }
 $BinDir = Join-Path $Root 'bin'
 $LogFile = Join-Path $Root 'agent.log'
 New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
@@ -102,33 +121,46 @@ New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
 # ── frpc ────────────────────────────────────────────────────────────────
 $FrpcExe = Join-Path $BinDir 'frpc.exe'
 if (-not (Test-Path $FrpcExe)) {
-    if (-not $FrpVersion) {
-        try {
-            $rel = Invoke-RestMethod -TimeoutSec 15 `
-                -Uri 'https://api.github.com/repos/fatedier/frp/releases/latest'
-            $FrpVersion = $rel.tag_name.TrimStart('v')
-        } catch { $FrpVersion = '0.70.1' }
-    }
+    # Версия зафиксирована намеренно. Раньше здесь запрашивался «latest» из
+    # GitHub API, и каждая машина получала то, что оказалось актуальным в момент
+    # установки. Архив сверяется с frp_sha256_checksums.txt из того же релиза:
+    # HTTPS говорит лишь «файл пришёл от github», но не «файл тот, что ожидали».
+    if (-not $FrpVersion) { $FrpVersion = '0.70.1' }
     $arch = if ([Environment]::Is64BitOperatingSystem) {
         if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'amd64' }
     } else { '386' }
 
-    $url = "https://github.com/fatedier/frp/releases/download/v$FrpVersion/frp_${FrpVersion}_windows_${arch}.zip"
-    $zip = Join-Path $env:TEMP "frp_$FrpVersion.zip"
+    $archive = "frp_${FrpVersion}_windows_${arch}.zip"
+    $base = "https://github.com/fatedier/frp/releases/download/v$FrpVersion"
+    $url = "$base/$archive"
+    $zip = Join-Path $env:TEMP $archive
+    $sums = Join-Path $env:TEMP "frp_${FrpVersion}_sha256.txt"
     Say "скачиваю frp $FrpVersion для windows/$arch"
     try {
         Invoke-WebRequest -Uri $url -OutFile $zip -TimeoutSec 180 -UseBasicParsing
+        Invoke-WebRequest -Uri "$base/frp_sha256_checksums.txt" -OutFile $sums `
+            -TimeoutSec 60 -UseBasicParsing
     } catch {
-        Warn "напрямую не скачалось, пробую через VPN ($Socks)"
-        # WebRequest не умеет SOCKS; просим пользователя либо включить
-        # системный прокси, либо скачать вручную.
+        # Invoke-WebRequest не умеет SOCKS, поэтому через VPN отсюда не зайти.
         Die "не удалось скачать frp. Скачайте $url вручную, распакуйте frpc.exe в $BinDir и запустите скрипт снова."
     }
+
+    $want = (Select-String -Path $sums -Pattern ([regex]::Escape($archive) + '$') `
+        | Select-Object -First 1).Line
+    if (-not $want) { Die "в списке контрольных сумм нет строки для $archive" }
+    $want = ($want -split '\s+')[0].ToLower()
+    $got = (Get-FileHash -Path $zip -Algorithm SHA256).Hash.ToLower()
+    if ($want -ne $got) {
+        Remove-Item -Force $zip, $sums -ErrorAction SilentlyContinue
+        Die "контрольная сумма не совпала для $archive`n  ожидалось: $want`n  получено:  $got`nАрхив НЕ распакован."
+    }
+    Say "sha256 совпал"
+
     $tmp = Join-Path $env:TEMP "frp_extract_$FrpVersion"
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
     Expand-Archive -Path $zip -DestinationPath $tmp -Force
     Copy-Item (Get-ChildItem -Recurse -Path $tmp -Filter 'frpc.exe' | Select-Object -First 1).FullName $FrpcExe -Force
-    Remove-Item -Recurse -Force $tmp, $zip -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force $tmp, $zip, $sums -ErrorAction SilentlyContinue
 }
 Say "frpc: $FrpcExe"
 
@@ -136,7 +168,7 @@ Say "frpc: $FrpcExe"
 $Conf = Join-Path $Root 'frpc.toml'
 $sb = [Text.StringBuilder]::new()
 $null = $sb.AppendLine(@"
-# Конфигурация агента kalitka. Сгенерирована Install-Agent.ps1.
+# Конфигурация агента gatelink. Сгенерирована Install-Agent.ps1.
 # Содержит секреты — не копируйте в общие папки.
 "@)
 
@@ -212,13 +244,18 @@ localPort = $HttpPort
 Set-Content -Path $Conf -Value $sb.ToString() -Encoding UTF8
 Say "конфигурация: $Conf"
 
+if ($RdpPort -le 0 -and $SshPort -le 0 -and $VncPort -le 0 -and $HttpPort -le 0) {
+    Warn "не указано ни одного порта — агент подключится к серверу, но ничего не опубликует."
+    Warn "Чтобы открыть доступ по RDP, перезапустите с параметром: -RdpPort 3389"
+}
+
 # ── автозапуск ──────────────────────────────────────────────────────────
 if ($NoService) {
     Say "автозапуск не ставился. Запуск вручную: `"$FrpcExe`" -c `"$Conf`""
     exit 0
 }
 
-$TaskName = 'kalitka-agent'
+$TaskName = 'gatelink-agent'
 $action = New-ScheduledTaskAction -Execute $FrpcExe -Argument "-c `"$Conf`""
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
@@ -230,12 +267,12 @@ if ($IsAdmin) {
     $trigger = New-ScheduledTaskTrigger -AtStartup
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
-        -Principal $principal -Settings $settings -Description 'kalitka agent (frpc)' | Out-Null
+        -Principal $principal -Settings $settings -Description 'gatelink agent (frpc)' | Out-Null
     Say "задача $TaskName зарегистрирована, запускается при старте системы"
 } else {
     $trigger = New-ScheduledTaskTrigger -AtLogOn
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
-        -Settings $settings -Description 'kalitka agent (frpc)' | Out-Null
+        -Settings $settings -Description 'gatelink agent (frpc)' | Out-Null
     Warn "запуск без прав администратора: агент стартует при входе в систему, а не при загрузке"
 }
 Start-ScheduledTask -TaskName $TaskName
@@ -245,10 +282,14 @@ Write-Host ""
 Write-Host "──────────────────────────────────────────────────────────────────────────"
 Write-Host " Агент установлен. Что теперь доступно:"
 Write-Host ""
-if ($RdpPort -gt 0)  { Write-Host "   RDP:   на машине-клиенте  .\Kalitka.ps1 rdp $Name" }
-if ($SshPort -gt 0)  { Write-Host "   SSH:   .\Kalitka.ps1 ssh $Name" }
+if ($RdpPort -gt 0)  { Write-Host "   RDP:   на машине-клиенте  .\GateLink.ps1 rdp $Name" }
+if ($SshPort -gt 0)  { Write-Host "   SSH:   .\GateLink.ps1 ssh $Name" }
+if ($VncPort -gt 0)  { Write-Host "   VNC:   .\GateLink.ps1 add $Name-vnc 5900" }
 if ($HttpPort -gt 0) { Write-Host "   Веб:   https://$Name.$($cfg.sub)" }
+if ($RdpPort -le 0 -and $SshPort -le 0 -and $VncPort -le 0 -and $HttpPort -le 0) {
+    Write-Host "   ничего не опубликовано — см. предупреждение выше"
+}
 Write-Host ""
 Write-Host " Лог агента: $LogFile"
-Write-Host " Состояние:  Get-ScheduledTask kalitka-agent"
+Write-Host " Состояние:  Get-ScheduledTask gatelink-agent"
 Write-Host "──────────────────────────────────────────────────────────────────────────"

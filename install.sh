@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# kalitka: установка агента на компьютер, к которому нужно подключаться.
+# gatelink: установка агента на компьютер, к которому нужно подключаться.
 #
 # Агент (frpc) держит одно исходящее соединение до сервера — через SOCKS
 # вашего VPN-клиента, то есть внутри Reality. Никаких портов на этой машине
@@ -7,26 +7,35 @@
 #
 #   ./install-agent.sh <строка-подключения> [опции]
 #
+# Ничего не публикуется само: какие локальные порты станут доступны, задаётся
+# флагами. Это осознанно — раньше SSH публиковался по умолчанию, и установка
+# агента молча открывала доступ к нему.
+#
 # Опции:
-#   --name ID          имя этой машины в туннелях (по умолчанию — hostname)
+#   --name ID          имя этой машины (по умолчанию — из строки подключения,
+#                      а если её выдали без имени — hostname)
 #   --mode РЕЖИМ       auto (по умолчанию) | vpn | direct
 #                      vpn    — через SOCKS VPN-клиента;
 #                      direct — websocket по HTTPS на :443, VPN не нужен;
 #                      auto   — vpn, если найден SOCKS, иначе direct.
 #   --direct           то же, что --mode direct
-#   --ssh-port PORT    какой локальный порт публиковать как SSH (0 — не публиковать)
+#   --ssh-port PORT    опубликовать SSH с этого локального порта (обычно 22)
 #   --vnc-port PORT    добавить приватный туннель к VNC (например 5900)
 #   --http PORT        опубликовать локальный веб-сервис на https://ID.<домен>
 #   --socks HOST:PORT  адрес SOCKS вашего VPN-клиента, если не определился сам
 #   --no-service       не ставить автозапуск, только конфигурацию
 set -euo pipefail
 
-# ── ниже вклеен lib/common.sh из приватного репозитория kalitka ──
-KALITKA_FRP_VERSION_FALLBACK="0.70.1"
+# ── ниже вклеен lib/common.sh из приватного репозитория gatelink ──
+# Версия frp зафиксирована намеренно. Раньше здесь запрашивался «latest» из
+# GitHub API, и каждая машина получала то, что оказалось актуальным в момент
+# установки: разные версии на разных машинах и молчаливое обновление до релиза,
+# которого никто не смотрел. Обновление версии — осознанная правка этой строки.
+GATELINK_FRP_VERSION_DEFAULT="0.70.1"
 
-k_say()  { printf '\033[1;36m[kalitka]\033[0m %s\n' "$*"; }
-k_warn() { printf '\033[1;33m[kalitka]\033[0m %s\n' "$*"; }
-k_die()  { printf '\033[1;31m[kalitka] ОШИБКА:\033[0m %s\n' "$*" >&2; exit 1; }
+k_say()  { printf '\033[1;36m[gatelink]\033[0m %s\n' "$*"; }
+k_warn() { printf '\033[1;33m[gatelink]\033[0m %s\n' "$*"; }
+k_die()  { printf '\033[1;31m[gatelink] ОШИБКА:\033[0m %s\n' "$*" >&2; exit 1; }
 
 # ── платформа ───────────────────────────────────────────────────────────
 k_detect_platform() {
@@ -73,12 +82,51 @@ k_enroll_decode() {
 	# Вход для машин без VPN: websocket по HTTPS на обычный :443.
 	K_GATE="$(_jget gate)"
 	K_GATE_PORT="$(_jget gatePort)"
+	# Строка агента (enroll.py --agent) содержит имя машины и её персональный
+	# секрет; строка клиента (enroll.py --client) — мастер-секрет, из которого
+	# клиент выводит секрет любой машины сам. См. k_stcp_secret.
+	K_NAME="$(_jget name)"
+	K_MASTER="$(_jget master)"
 
 	[[ -n "$K_TOKEN" ]] || k_die "в строке подключения нет token"
 	[[ -n "$K_SERVER" || -n "$K_GATE" ]] || k_die "в строке подключения нет ни server, ни gate"
 	: "${K_PORT:=7000}"
 	: "${K_GATE_PORT:=443}"
-	export K_SERVER K_PORT K_TOKEN K_SECRET K_SUB K_GATE K_GATE_PORT
+	export K_SERVER K_PORT K_TOKEN K_SECRET K_SUB K_GATE K_GATE_PORT K_NAME K_MASTER
+}
+
+# ── секрет приватного туннеля ───────────────────────────────────────────
+# Секрет у каждой машины свой и выводится из мастер-секрета:
+#
+#     secret(машина) = HMAC-SHA256(мастер, "gatelink-stcp-v1:" + имя_машины)
+#
+# Смысл: агент получает только свой секрет, поэтому украденная с одной машины
+# конфигурация не открывает приватные туннели остальных. Мастер есть только на
+# сервере и на машине-визиторе (той, С КОТОРОЙ подключаются), а она и так имеет
+# доступ ко всем. Вывод детерминированный, поэтому визитору не нужен ни реестр
+# секретов, ни обращение к серверу — он считает нужный секрет на месте.
+#
+# k_stcp_secret <мастер> <имя-машины>
+k_stcp_secret() {
+	local master="$1" name="$2" msg
+	[[ -n "$master" ]] || k_die "внутренняя ошибка: k_stcp_secret без мастер-секрета"
+	[[ -n "$name" ]]   || k_die "внутренняя ошибка: k_stcp_secret без имени машины"
+	msg="gatelink-stcp-v1:$name"
+	if command -v openssl >/dev/null 2>&1; then
+		printf '%s' "$msg" | openssl dgst -sha256 -hmac "$master" | awk '{print $NF}'
+	elif command -v python3 >/dev/null 2>&1; then
+		python3 -c 'import hmac,hashlib,sys;print(hmac.new(sys.argv[1].encode(),sys.argv[2].encode(),hashlib.sha256).hexdigest())' \
+			"$master" "$msg"
+	else
+		k_die "нужен openssl или python3, чтобы вывести секрет туннеля"
+	fi
+}
+
+# Имя машины из имени туннеля: `home-ssh` → `home`. Секрет привязан к машине,
+# а не к отдельному сервису, поэтому все туннели одной машины делят один секрет.
+k_machine_of() {
+	local name="$1"
+	if [[ "$name" == *-* ]]; then printf '%s' "${name%-*}"; else printf '%s' "$name"; fi
 }
 
 # ── выбор транспорта ────────────────────────────────────────────────────
@@ -147,15 +195,23 @@ EOF
 # ── поиск SOCKS-прокси VPN-клиента ──────────────────────────────────────
 # Порт зависит от приложения: v2rayN/v2rayNG — 10808, Nekoray и sing-box — 2080,
 # Hiddify — 12334, Clash — 7890. Пробуем по очереди, можно задать вручную:
-#   export KALITKA_SOCKS=127.0.0.1:10808
+#   export GATELINK_SOCKS=127.0.0.1:10808
+#
+# Важно: через найденный прокси пойдёт управляющий канал с токеном, а TLS до
+# frps идёт без проверки сертификата сервера (frps отдаёт самоподписанный).
+# То есть любой локальный процесс, успевший занять один из этих портов, увидит
+# токен. На машине, где могут работать чужие программы, порт лучше задавать
+# явно через GATELINK_SOCKS, а не полагаться на автоопределение.
 k_socks_detect() {
-	if [[ -n "${KALITKA_SOCKS:-}" ]]; then
-		printf '%s' "$KALITKA_SOCKS"
+	if [[ -n "${GATELINK_SOCKS:-}" ]]; then
+		printf '%s' "$GATELINK_SOCKS"
 		return 0
 	fi
 	local p
 	for p in 10808 2080 12334 7890 1080 1081 10801 20170; do
 		if k_port_open 127.0.0.1 "$p"; then
+			k_warn "SOCKS найден автоопределением на 127.0.0.1:$p." >&2
+			k_warn "Через него пойдёт токен — если на машине бывают чужие процессы, задайте порт явно (GATELINK_SOCKS)." >&2
 			printf '127.0.0.1:%s' "$p"
 			return 0
 		fi
@@ -175,42 +231,78 @@ k_port_open() {
 }
 
 # ── загрузка frpc ───────────────────────────────────────────────────────
-k_frp_latest_version() {
-	local v
-	v="$(curl -fsSL --max-time 10 \
-		https://api.github.com/repos/fatedier/frp/releases/latest 2>/dev/null \
-		| sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\([^"]*\)".*/\1/p' | head -1)"
-	printf '%s' "${v:-$KALITKA_FRP_VERSION_FALLBACK}"
+# Считает sha256 файла тем, что есть в системе (GNU coreutils, BSD/macOS, или
+# openssl как последний вариант).
+k_sha256() {
+	local f="$1"
+	if command -v sha256sum >/dev/null 2>&1; then
+		sha256sum "$f" | awk '{print $1}'
+	elif command -v shasum >/dev/null 2>&1; then
+		shasum -a 256 "$f" | awk '{print $1}'
+	elif command -v openssl >/dev/null 2>&1; then
+		openssl dgst -sha256 "$f" | awk '{print $NF}'
+	else
+		return 1
+	fi
 }
 
 # k_install_frpc <куда_положить_бинарь> [socks_для_загрузки]
+#
+# Версия фиксирована (GATELINK_FRP_VERSION_DEFAULT), архив сверяется с
+# frp_sha256_checksums.txt из того же релиза. HTTPS сам по себе гарантирует
+# только «файл пришёл от github», а не «файл тот, который мы ожидали»: без
+# проверки суммы подменённый или битый архив ставится молча.
 k_install_frpc() {
-	local dest="$1" socks="${2:-}" ver url tmp curl_opts=()
+	local dest="$1" socks="${2:-}" ver url sums_url tmp archive want got
+
 	k_detect_platform
 
-	if [[ -x "$dest" && -z "${KALITKA_FORCE_DOWNLOAD:-}" ]]; then
+	if [[ -x "$dest" && -z "${GATELINK_FORCE_DOWNLOAD:-}" ]]; then
 		k_say "frpc уже установлен: $dest ($("$dest" --version 2>/dev/null || echo '?'))"
 		return 0
 	fi
 
-	ver="${KALITKA_FRP_VERSION:-$(k_frp_latest_version)}"
-	url="https://github.com/fatedier/frp/releases/download/v${ver}/frp_${ver}_${K_OS}_${K_ARCH}.tar.gz"
+	ver="${GATELINK_FRP_VERSION:-$GATELINK_FRP_VERSION_DEFAULT}"
+	archive="frp_${ver}_${K_OS}_${K_ARCH}.tar.gz"
+	url="https://github.com/fatedier/frp/releases/download/v${ver}/${archive}"
+	sums_url="https://github.com/fatedier/frp/releases/download/v${ver}/frp_sha256_checksums.txt"
 	tmp="$(mktemp -d)"
 
-	k_say "скачиваю frp $ver для ${K_OS}/${K_ARCH}"
-	if ! curl -fsSL --max-time 120 -o "$tmp/frp.tar.gz" "$url"; then
+	# Загрузка одного URL: сначала напрямую, при неудаче — через VPN, если он есть.
+	_fetch() {
+		local out="$1" src="$2"
+		curl -fsSL --max-time 180 -o "$out" "$src" && return 0
 		if [[ -n "$socks" ]]; then
 			k_warn "напрямую не скачалось, пробую через VPN ($socks)"
-			curl -fsSL --max-time 180 --proxy "socks5h://$socks" -o "$tmp/frp.tar.gz" "$url" \
-				|| k_die "не удалось скачать frp ни напрямую, ни через VPN"
-		else
-			k_die "не удалось скачать $url"
+			curl -fsSL --max-time 240 --proxy "socks5h://$socks" -o "$out" "$src" && return 0
 		fi
+		return 1
+	}
+
+	k_say "скачиваю frp $ver для ${K_OS}/${K_ARCH}"
+	_fetch "$tmp/frp.tar.gz" "$url" || { rm -rf "$tmp"; k_die "не удалось скачать $url"; }
+	_fetch "$tmp/sums.txt"   "$sums_url" \
+		|| { rm -rf "$tmp"; k_die "не удалось скачать список контрольных сумм $sums_url"; }
+
+	want="$(awk -v f="$archive" '$2 == f || $2 == "*" f {print $1; exit}' "$tmp/sums.txt")"
+	got="$(k_sha256 "$tmp/frp.tar.gz")" \
+		|| { rm -rf "$tmp"; k_die "нечем посчитать sha256 (нужен sha256sum, shasum или openssl)"; }
+	if [[ -z "$want" ]]; then
+		rm -rf "$tmp"
+		k_die "в списке контрольных сумм нет строки для $archive — версия $ver собрана без этой платформы?"
 	fi
+	if [[ "$want" != "$got" ]]; then
+		rm -rf "$tmp"
+		k_die "контрольная сумма не совпала для $archive
+  ожидалось: $want
+  получено:  $got
+Архив НЕ распакован. Это либо повреждённая загрузка, либо подмена файла."
+	fi
+	k_say "sha256 совпал"
 
 	tar -xzf "$tmp/frp.tar.gz" -C "$tmp"
 	install -m 0755 "$tmp/frp_${ver}_${K_OS}_${K_ARCH}/frpc" "$dest" \
-		|| k_die "не удалось положить frpc в $dest"
+		|| { rm -rf "$tmp"; k_die "не удалось положить frpc в $dest"; }
 	rm -rf "$tmp"
 	k_say "frpc установлен: $dest"
 }
@@ -220,14 +312,17 @@ k_install_frpc() {
 # запускают как `curl … | bash`, и тогда файла, из которого можно читать, нет.
 usage() {
 	cat <<'USAGE'
-kalitka: установка агента на компьютер, к которому нужно подключаться.
+gatelink: установка агента на компьютер, к которому нужно подключаться.
 
     install.sh <строка-подключения> [опции]
 
-    --name ID          имя этой машины в туннелях (по умолчанию — hostname)
+Без флагов публикации агент не публикует ничего: подключается к серверу и ждёт.
+Какие локальные порты станут доступны — решаете вы.
+
+    --name ID          имя этой машины (по умолчанию — из строки подключения)
     --mode РЕЖИМ       auto (по умолчанию) | vpn | direct
     --direct           то же, что --mode direct
-    --ssh-port PORT    какой локальный порт публиковать как SSH (0 — не публиковать)
+    --ssh-port PORT    опубликовать SSH с этого локального порта (обычно 22)
     --public-ssh [П]   публичный адрес для SSH, как у ngrok: подключаться можно
                        обычным ssh без клиентской части. Без аргумента порт
                        выдаёт сервер, с аргументом — фиксированный
@@ -235,12 +330,16 @@ kalitka: установка агента на компьютер, к котор�
     --http PORT        опубликовать локальный веб-сервис на https://ID.<домен>
     --socks HOST:PORT  адрес SOCKS вашего VPN-клиента, если не определился сам
     --no-service       не ставить автозапуск, только конфигурацию
+
+Примеры:
+    install.sh '<строка>' --ssh-port 22            приватный доступ по SSH
+    install.sh '<строка>' --http 3000              веб-сервис наружу
 USAGE
 }
 
 ENROLL=""
 NAME=""
-SSH_PORT=22
+SSH_PORT=0
 PUBLIC_SSH=""
 VNC_PORT=""
 HTTP_PORT=""
@@ -278,13 +377,13 @@ k_detect_platform
 # ── куда ставить ────────────────────────────────────────────────────────
 if [[ $EUID -eq 0 ]]; then
 	BIN_DIR=/usr/local/bin
-	CONF_DIR=/etc/kalitka
-	LOG_FILE=/var/log/kalitka-agent.log
+	CONF_DIR=/etc/gatelink
+	LOG_FILE=/var/log/gatelink-agent.log
 	SCOPE=system
 else
 	BIN_DIR="$HOME/.local/bin"
-	CONF_DIR="$HOME/.config/kalitka"
-	LOG_FILE="$HOME/.local/state/kalitka/agent.log"
+	CONF_DIR="$HOME/.config/gatelink"
+	LOG_FILE="$HOME/.local/state/gatelink/agent.log"
 	SCOPE=user
 	k_warn "запуск без root: агент будет работать от вашего пользователя"
 fi
@@ -292,12 +391,29 @@ mkdir -p "$BIN_DIR" "$CONF_DIR" "$(dirname "$LOG_FILE")"
 chmod 700 "$CONF_DIR"
 
 # ── имя машины ──────────────────────────────────────────────────────────
-if [[ -z "$NAME" ]]; then
-	NAME="$(hostname -s 2>/dev/null || hostname)"
+# Имя приходит в строке подключения: секрет этой машины выведен именно из него
+# (HMAC от имени), поэтому переименовать машину на этой стороне нельзя — секрет
+# перестанет совпадать с тем, что посчитает визитор. Нужно другое имя — новая
+# строка подключения: server/enroll.py agent --name ДРУГОЕ-ИМЯ.
+if [[ -n "$K_NAME" ]]; then
+	if [[ -n "$NAME" && "$NAME" != "$K_NAME" ]]; then
+		k_die "строка подключения выдана на имя «$K_NAME», а --name задаёт «$NAME».
+Секрет этой машины выведен из имени, поэтому имя менять здесь нельзя.
+Возьмите строку для нужного имени: server/enroll.py agent --name $NAME"
+	fi
+	NAME="$K_NAME"
+else
+	# Строка старого формата, одна на всех: имя выбирает сама машина.
+	[[ -n "$NAME" ]] || NAME="$(hostname -s 2>/dev/null || hostname)"
+	k_warn "строка подключения старого формата — секрет общий для всех машин."
+	k_warn "Перевыпустите её на сервере: server/enroll.py agent --name ИМЯ"
 fi
 NAME="$(printf '%s' "$NAME" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed 's/^-*//;s/-*$//')"
 [[ -n "$NAME" ]] || k_die "не получилось определить имя машины, задайте --name"
+[[ ${#NAME} -le 31 ]] || k_die "имя длиннее 31 символа: $NAME"
 k_say "имя этой машины в туннелях: $NAME"
+
+[[ -n "$K_SECRET" ]] || k_die "в строке подключения нет секрета приватных туннелей"
 
 # ── SOCKS VPN-клиента ───────────────────────────────────────────────────
 SOCKS="${SOCKS_OVERRIDE:-$(k_socks_detect || true)}"
@@ -314,7 +430,7 @@ k_install_frpc "$BIN_DIR/frpc" "$SOCKS"
 # ── конфигурация ────────────────────────────────────────────────────────
 CONF="$CONF_DIR/frpc.toml"
 {
-	echo "# Конфигурация агента kalitka. Сгенерирована install-agent.sh."
+	echo "# Конфигурация агента gatelink. Сгенерирована install-agent.sh."
 	echo "# Содержит секреты — права 600, в репозиторий не класть."
 	echo
 	k_frpc_header "$MODE" "$SOCKS" "$LOG_FILE"
@@ -379,6 +495,11 @@ EOF
 chmod 600 "$CONF"
 k_say "конфигурация: $CONF"
 
+if [[ "$SSH_PORT" == "0" && -z "$PUBLIC_SSH" && -z "$VNC_PORT" && -z "$HTTP_PORT" ]]; then
+	k_warn "не указано ни одного порта — агент подключится к серверу, но ничего не опубликует."
+	k_warn "Чтобы открыть доступ по SSH, перезапустите с флагом: --ssh-port 22"
+fi
+
 # ── автозапуск ──────────────────────────────────────────────────────────
 start_manually() {
 	cat <<EOF
@@ -395,7 +516,7 @@ fi
 
 if [[ "$K_OS" == linux ]]; then
 	UNIT_BODY="[Unit]
-Description=kalitka agent (frpc)
+Description=gatelink agent (frpc)
 After=network-online.target
 Wants=network-online.target
 
@@ -411,37 +532,37 @@ StartLimitIntervalSec=0
 WantedBy=$( [[ $SCOPE == system ]] && echo multi-user.target || echo default.target )
 "
 	if [[ $SCOPE == system ]]; then
-		printf '%s' "$UNIT_BODY" >/etc/systemd/system/kalitka-agent.service
+		printf '%s' "$UNIT_BODY" >/etc/systemd/system/gatelink-agent.service
 		systemctl daemon-reload
-		systemctl enable kalitka-agent.service
+		systemctl enable gatelink-agent.service
 		# Именно restart, а не `enable --now`: при повторной установке сервис уже
 		# запущен, `--now` его не трогает, и агент продолжает работать со старой
 		# конфигурацией. Заодно снимается вторая копия, если она осталась.
-		systemctl restart kalitka-agent.service
+		systemctl restart gatelink-agent.service
 		sleep 2
-		systemctl --no-pager --lines=10 status kalitka-agent.service || true
-		k_say "сервис: systemctl status kalitka-agent"
+		systemctl --no-pager --lines=10 status gatelink-agent.service || true
+		k_say "сервис: systemctl status gatelink-agent"
 	else
 		mkdir -p "$HOME/.config/systemd/user"
-		printf '%s' "$UNIT_BODY" >"$HOME/.config/systemd/user/kalitka-agent.service"
+		printf '%s' "$UNIT_BODY" >"$HOME/.config/systemd/user/gatelink-agent.service"
 		systemctl --user daemon-reload
-		systemctl --user enable kalitka-agent.service
-		systemctl --user restart kalitka-agent.service
+		systemctl --user enable gatelink-agent.service
+		systemctl --user restart gatelink-agent.service
 		loginctl enable-linger "$USER" >/dev/null 2>&1 || \
 			k_warn "не удалось включить linger — агент остановится при выходе из сессии"
 		sleep 2
-		systemctl --user --no-pager --lines=10 status kalitka-agent.service || true
-		k_say "сервис: systemctl --user status kalitka-agent"
+		systemctl --user --no-pager --lines=10 status gatelink-agent.service || true
+		k_say "сервис: systemctl --user status gatelink-agent"
 	fi
 else
-	PLIST="$HOME/Library/LaunchAgents/tech.kalitka.agent.plist"
+	PLIST="$HOME/Library/LaunchAgents/tech.gatelink.agent.plist"
 	mkdir -p "$(dirname "$PLIST")"
 	cat >"$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>Label</key><string>tech.kalitka.agent</string>
+	<key>Label</key><string>tech.gatelink.agent</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>$BIN_DIR/frpc</string>
@@ -456,7 +577,7 @@ else
 EOF
 	launchctl unload "$PLIST" >/dev/null 2>&1 || true
 	launchctl load "$PLIST"
-	k_say "launchd: tech.kalitka.agent загружен"
+	k_say "launchd: tech.gatelink.agent загружен"
 fi
 
 cat <<EOF
@@ -464,10 +585,10 @@ cat <<EOF
 ──────────────────────────────────────────────────────────────────────────
  Агент установлен. Что теперь доступно:
 
-   SSH:   на машине-клиенте  ./client/kalitka.sh ssh $NAME
+$( [[ "$SSH_PORT" != "0" ]] && echo "   SSH:   на машине-клиенте  ./client/gatelink.sh ssh $NAME" )
 $( [[ -n "$PUBLIC_SSH" ]] && echo "   SSH (публичный): адрес и порт покажет веб-панель — подключаться
           обычным ssh, клиентская часть не нужна" )
-$( [[ -n "$VNC_PORT" ]] && echo "   VNC:   ./client/kalitka.sh open $NAME-vnc 5900" )
+$( [[ -n "$VNC_PORT" ]] && echo "   VNC:   ./client/gatelink.sh open $NAME-vnc 5900" )
 $( [[ -n "$HTTP_PORT" ]] && echo "   Веб:   https://$NAME.$K_SUB" )
 
  Лог агента: $LOG_FILE

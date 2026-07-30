@@ -1,6 +1,6 @@
-# kalitka-agent
+# gatelink-agent
 
-Агент [kalitka](https://github.com/Yarik9008/kalitka) — ставится на компьютер,
+Агент [GateLink](https://github.com/Yarik9008/gatelink) — ставится на компьютер,
 к которому нужно получать доступ снаружи.
 
 Компьютер за NAT, без белого IP и без проброса портов на роутере становится
@@ -14,14 +14,14 @@
 Linux и macOS — одной командой:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Yarik9008/kalitka-agent/main/install.sh \
+curl -fsSL https://raw.githubusercontent.com/Yarik9008/gatelink-agent/main/install.sh \
   | bash -s -- '<строка-подключения>' --name имя-машины
 ```
 
 Windows, PowerShell от администратора:
 
 ```powershell
-irm https://raw.githubusercontent.com/Yarik9008/kalitka-agent/main/Install-Agent.ps1 -OutFile Install-Agent.ps1
+irm https://raw.githubusercontent.com/Yarik9008/gatelink-agent/main/Install-Agent.ps1 -OutFile Install-Agent.ps1
 .\Install-Agent.ps1 -Enroll '<строка-подключения>' -Name имя-машины
 ```
 
@@ -92,34 +92,34 @@ Windows: те же ключи в PowerShell-стиле (`-Name`, `-RdpPort`, `-H
 
 ```bash
 # Linux (root)
-systemctl status kalitka-agent
-journalctl -u kalitka-agent -f
-tail -f /var/log/kalitka-agent.log
+systemctl status gatelink-agent
+journalctl -u gatelink-agent -f
+tail -f /var/log/gatelink-agent.log
 
 # Linux (без root)
-systemctl --user status kalitka-agent
+systemctl --user status gatelink-agent
 
 # macOS
-launchctl list | grep kalitka
+launchctl list | grep gatelink
 ```
 
 ```powershell
 # Windows
-Get-ScheduledTask kalitka-agent
-Get-Content $env:ProgramData\kalitka\agent.log -Tail 20
+Get-ScheduledTask gatelink-agent
+Get-Content $env:ProgramData\gatelink\agent.log -Tail 20
 ```
 
 ## Удаление
 
 ```bash
-sudo systemctl disable --now kalitka-agent
-sudo rm -f /etc/systemd/system/kalitka-agent.service /usr/local/bin/frpc
-sudo rm -rf /etc/kalitka
+sudo systemctl disable --now gatelink-agent
+sudo rm -f /etc/systemd/system/gatelink-agent.service /usr/local/bin/frpc
+sudo rm -rf /etc/gatelink
 ```
 
 ```powershell
-Unregister-ScheduledTask kalitka-agent -Confirm:$false
-Remove-Item -Recurse $env:ProgramData\kalitka
+Unregister-ScheduledTask gatelink-agent -Confirm:$false
+Remove-Item -Recurse $env:ProgramData\gatelink
 ```
 
 ## Безопасность
